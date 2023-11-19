@@ -1,0 +1,305 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <sqlite3.h>
+#include <nlohmann/json.hpp>
+#include <curl/curl.h>
+
+using json = nlohmann::json;
+
+class CVEDataProcessor {
+public:
+    CVEDataProcessor(const std::string& databaseFile = "/home/escan/aaaa/cvebintool/cve_cpp.db") : databaseFile(databaseFile) {
+        connection = nullptr;
+    }
+
+    void refresh() {
+        initDatabase();
+        processAllCacheDirs();
+        updateExploits();
+    }
+
+private:
+    sqlite3* connection;
+    std::string databaseFile;
+    std::string cachedir;
+
+    static int callback(void* notUsed, int argc, char** argv, char** azColName) {
+        return 0;
+    }
+
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* output) {
+        size_t totalSize = size * nmemb;
+        output->append((char*)contents, totalSize);
+        return totalSize;
+    }
+
+    void initDatabase() {
+        dbOpen();
+        executeQuery("CREATE TABLE IF NOT EXISTS cve_severity ("
+                     "cve_number TEXT, severity TEXT, description TEXT, score INTEGER, "
+                     "cvss_version INTEGER, cvss_vector TEXT, data_source TEXT, last_modified TIMESTAMP, "
+                     "PRIMARY KEY(cve_number, data_source));");
+
+        executeQuery("CREATE TABLE IF NOT EXISTS cve_range ("
+                     "cve_number TEXT, vendor TEXT, product TEXT, version TEXT, "
+                     "versionStartIncluding TEXT, versionStartExcluding TEXT, "
+                     "versionEndIncluding TEXT, versionEndExcluding TEXT, data_source TEXT, "
+                     "FOREIGN KEY(cve_number, data_source) REFERENCES cve_severity(cve_number, data_source));");
+
+        executeQuery("CREATE TABLE IF NOT EXISTS cve_exploited ("
+                     "cve_number TEXT, product TEXT, description TEXT, "
+                     "PRIMARY KEY(cve_number));");
+
+        executeQuery("CREATE INDEX IF NOT EXISTS product_index ON cve_range (cve_number, vendor, product);");
+    }
+
+    void dbOpen() {
+        if (connection == nullptr) {
+            sqlite3_open(databaseFile.c_str(), &connection);
+        }
+    }
+
+    void executeQuery(const std::string& query) {
+        char* errorMsg = nullptr;
+        sqlite3_exec(connection, query.c_str(), callback, nullptr, &errorMsg);
+        if (errorMsg != nullptr) {
+            std::cerr << "SQL error: " << errorMsg << std::endl;
+            sqlite3_free(errorMsg);
+        }
+    }
+
+    void updateExploits() {
+        std::string url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+        std::string responseData;
+        curlRequest(url, responseData);
+
+        json data = json::parse(responseData);
+        json cves = data["vulnerabilities"];
+
+        std::vector<std::tuple<std::string, std::string, std::string>> exploitList;
+        for (const auto& cve : cves) {
+            exploitList.emplace_back(cve["cveID"], cve["product"], cve["shortDescription"]);
+        }
+
+        populateExploitDB(exploitList);
+    }
+
+    void populateExploitDB(const std::vector<std::tuple<std::string, std::string, std::string>>& exploitList) {
+        dbOpen();
+
+        for (const auto& exploit : exploitList) {
+            std::string cveNumber = std::get<0>(exploit);
+            std::string product = std::get<1>(exploit);
+            std::string description = std::get<2>(exploit);
+
+            std::ostringstream query;
+            query << "INSERT OR REPLACE INTO cve_exploited (cve_number, product, description) VALUES ('"
+                  << cveNumber << "', '" << product << "', '" << description << "');";
+
+            executeQuery(query.str());
+        }
+    }
+
+    void processAllCacheDirs() {
+        std::vector<std::string> cacheDirs = {"/home/escan/181023/data_source/nvd"};
+
+        for (const auto& cacheDir : cacheDirs) {
+            processCacheDir(cacheDir);
+        }
+    }
+
+    void processCacheDir(const std::string& cacheDir) {
+        if (!directoryExists(cacheDir)) {
+            std::cout << "Cache directory does not exist: " << cacheDir << std::endl;
+            return;
+        }
+
+        for (const auto& file : getFilesInDirectory(cacheDir, "*.json.gz")) {
+            std::ifstream gzFile(file, std::ios::binary);
+            std::ostringstream jsonStream;
+            gzFile.exceptions(std::ios::failbit | std::ios::badbit);
+
+            try {
+                jsonStream << gzFile.rdbuf();
+                json json_data = json::parse(jsonStream.str());
+                insertCVEData(json_data);
+            } catch (const std::exception& e) {
+                std::cerr << "Error processing file " << file << ": " << e.what() << std::endl;
+            }
+        }
+    }
+
+    void insertCVEData(const json& jsonData) {
+        dbOpen();
+
+        for (const auto& cveItem : jsonData["CVE_Items"]) {
+            std::string cveNumber = cveItem["cve"]["CVE_data_meta"]["ID"];
+            std::string existingEntryQuery = "SELECT 1 FROM cve_severity WHERE cve_number = '" + cveNumber + "';";
+            if (!entryExists(existingEntryQuery)) {
+                auto [severity, description, score, cvssVersion, cvssVector, dataSource, lastModified] =
+                    extractSeverityInfo(cveItem);
+                insertCVESeverity(cveNumber, severity, description, score, cvssVersion, cvssVector, dataSource, lastModified);
+
+                insertCVERange(cveNumber, cveItem["configurations"]);
+            }
+        }
+    }
+
+    bool entryExists(const std::string& query) {
+        char* errorMsg = nullptr;
+        int result = 0;
+        sqlite3_exec(connection, query.c_str(), callback, &result, &errorMsg);
+        if (errorMsg != nullptr) {
+            std::cerr << "SQL error: " << errorMsg << std::endl;
+            sqlite3_free(errorMsg);
+        }
+        return result != 0;
+    }
+
+    std::tuple<std::string, std::string, int, double, std::string, std::string, std::string> extractSeverityInfo(const json& cveItem) {
+        std::string description = "No description available";
+
+        // Check for V3 first
+        auto impactV3 = cveItem.value("impact", json::object()).value("baseMetricV3", json::object());
+        if (!impactV3.empty()) {
+            return {impactV3.value("cvssV3", json::object()).value("baseSeverity", "Unknown"),
+                    description,
+                    impactV3.value("cvssV3", json::object()).value("baseScore", 0),
+                    impactV3.value("cvssV3", json::object()).value("version", 0.0),
+                    impactV3.value("cvssV3", json::object()).value("vectorString", "Unknown"),
+                    "NVD",
+                    cveItem.value("lastModifiedDate", "Unknown")};
+        } else {
+            // If V3 is not present, check for V2
+            auto impactV2 = cveItem.value("impact", json::object()).value("baseMetricV2", json::object());
+            if (!impactV2.empty()) {
+                return {impactV2.value("severity", "Unknown"),
+                        description,
+                        impactV2.value("cvssV2", json::object()).value("baseScore", 0),
+                        impactV2.value("cvssV2", json::object()).value("version", 0.0),
+                        impactV2.value("cvssV2", json::object()).value("vectorString", "Unknown"),
+                        "NVD",
+                        cveItem.value("lastModifiedDate", "Unknown")};
+            } else {
+                // Neither V3 nor V2 data is present
+                return {"Unknown", description, 0, 0.0, "Unknown", "NVD", cveItem.value("lastModifiedDate", "Unknown")};
+            }
+        }
+    }
+
+    void insertCVESeverity(const std::string& cveNumber, const std::string& severity, const std::string& description,
+                           int score, double cvssVersion, const std::string& cvssVector, const std::string& dataSource,
+                           const std::string& lastModified) {
+        std::ostringstream query;
+        query << "INSERT OR REPLACE INTO cve_severity (cve_number, severity, description, score, cvss_version, "
+              << "cvss_vector, data_source, last_modified) VALUES ('" << cveNumber << "', '" << severity << "', '"
+              << description << "', " << score << ", " << cvssVersion << ", '" << cvssVector << "', '" << dataSource
+              << "', '" << lastModified << "');";
+
+        executeQuery(query.str());
+    }
+
+    void insertCVERange(const std::string& cveNumber, const json& configurations) {
+        if (configurations.contains("nodes")) {
+            for (const auto& node : configurations["nodes"]) {
+                insertCVERangeNode(cveNumber, node);
+                if (node.contains("children")) {
+                    for (const auto& child : node["children"]) {
+                        insertCVERangeNode(cveNumber, child);
+                    }
+                }
+            }
+        }
+    }
+
+    void insertCVERangeNode(const std::string& cveNumber, const json& node) {
+        if (node.contains("cpe_match")) {
+            for (const auto& cpeMatch : node["cpe_match"]) {
+                auto cpeSplit = splitCPE(cpeMatch.value("cpe23Uri", ""));
+                std::string vendor = cpeSplit[3];
+                std::string product = cpeSplit[4];
+                std::string version = cpeSplit[5];
+                auto versionInfo = getVersionInfo(cpeMatch);
+
+                insertCVERangeInfo(cveNumber, vendor, product, version, versionInfo);
+            }
+        }
+    }
+
+    void insertCVERangeInfo(const std::string& cveNumber, const std::string& vendor, const std::string& product,
+                            const std::string& version, const std::map<std::string, std::string>& versionInfo) {
+        std::ostringstream query;
+        query << "INSERT OR REPLACE INTO cve_range (cve_number, vendor, product, version, versionStartIncluding, "
+              << "versionStartExcluding, versionEndIncluding, versionEndExcluding) VALUES ('" << cveNumber << "', '"
+              << vendor << "', '" << product << "', '" << version << "', '" << versionInfo.at("versionStartIncluding")
+              << "', '" << versionInfo.at("versionStartExcluding") << "', '" << versionInfo.at("versionEndIncluding")
+              << "', '" << versionInfo.at("versionEndExcluding") << "');";
+
+        executeQuery(query.str());
+    }
+
+    std::map<std::string, std::string> getVersionInfo(const json& cpeMatch) {
+        return {
+            {"versionStartIncluding", cpeMatch.value("versionStartIncluding", "")},
+            {"versionStartExcluding", cpeMatch.value("versionStartExcluding", "")},
+            {"versionEndIncluding", cpeMatch.value("versionEndIncluding", "")},
+            {"versionEndExcluding", cpeMatch.value("versionEndExcluding", "")},
+        };
+    }
+
+    std::vector<std::string> splitCPE(const std::string& cpe23Uri) {
+        std::vector<std::string> result;
+        std::istringstream iss(cpe23Uri);
+        std::string token;
+
+        while (std::getline(iss, token, ':')) {
+            result.push_back(token);
+        }
+
+        return result;
+    }
+
+    void curlRequest(const std::string& url, std::string& responseData) {
+        CURL* curl = curl_easy_init();
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseData);
+
+            CURLcode res = curl_easy_perform(curl);
+            if (res != CURLE_OK) {
+                std::cerr << "Curl request failed: " << curl_easy_strerror(res) << std::endl;
+            }
+
+            curl_easy_cleanup(curl);
+        }
+    }
+
+    bool directoryExists(const std::string& dirPath) {
+        struct stat info;
+        return stat(dirPath.c_str(), &info) == 0 && info.st_mode & S_IFDIR;
+    }
+
+    std::vector<std::string> getFilesInDirectory(const std::string& dirPath, const std::string& extension) {
+        std::vector<std::string> files;
+        for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
+            if (entry.is_regular_file() && entry.path().extension() == extension) {
+                files.push_back(entry.path().string());
+            }
+        }
+        return files;
+    }
+};
+
+int main() {
+    CVEDataProcessor cveDataProcessor;
+
+    // Initialize the database tables
+    cveDataProcessor.refresh();
+
+    return 0;
+}
+
